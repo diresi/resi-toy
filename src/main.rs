@@ -27,10 +27,14 @@ mod lexer {
     pub enum TokenKind {
         Ident(String),
         Number(i64),
+        StringLiteral(String),
+        RawStringLiteral(String), // full raw lexeme, e.g. r#"hello"#
+
         KwFn,
         KwLet,
         KwReturn,
         KwMagic,
+
         Arrow,
         LParen,
         RParen,
@@ -58,11 +62,13 @@ mod lexer {
         let mut tokens = Vec::new();
         let mut i = 0;
         let bytes = input.as_bytes();
+        let len = bytes.len();
 
-        while i < bytes.len() {
+        while i < len {
             let c = bytes[i] as char;
             match c {
                 ' ' | '\t' | '\n' | '\r' => i += 1,
+
                 '(' => { tokens.push(tok(TokenKind::LParen, i)); i += 1; }
                 ')' => { tokens.push(tok(TokenKind::RParen, i)); i += 1; }
                 '{' => { tokens.push(tok(TokenKind::LBrace, i)); i += 1; }
@@ -71,8 +77,14 @@ mod lexer {
                 ',' => { tokens.push(tok(TokenKind::Comma, i)); i += 1; }
                 ';' => { tokens.push(tok(TokenKind::Semicolon, i)); i += 1; }
                 '+' => { tokens.push(tok(TokenKind::Plus, i)); i += 1; }
+                '*' => { tokens.push(tok(TokenKind::Star, i)); i += 1; }
+                '/' => { tokens.push(tok(TokenKind::Slash, i)); i += 1; }
+                '=' => { tokens.push(tok(TokenKind::Eq, i)); i += 1; }
+                '<' => { tokens.push(tok(TokenKind::Lt, i)); i += 1; }
+                '>' => { tokens.push(tok(TokenKind::Gt, i)); i += 1; }
+
                 '-' => {
-                    if i + 1 < bytes.len() && bytes[i + 1] as char == '>' {
+                    if i + 1 < len && bytes[i + 1] as char == '>' {
                         tokens.push(tok(TokenKind::Arrow, i));
                         i += 2;
                     } else {
@@ -80,32 +92,113 @@ mod lexer {
                         i += 1;
                     }
                 }
-                '*' => { tokens.push(tok(TokenKind::Star, i)); i += 1; }
-                '/' => { tokens.push(tok(TokenKind::Slash, i)); i += 1; }
-                '=' => { tokens.push(tok(TokenKind::Eq, i)); i += 1; }
-                '<' => { tokens.push(tok(TokenKind::Lt, i)); i += 1; }
-                '>' => { tokens.push(tok(TokenKind::Gt, i)); i += 1; }
+
+                '"' => {
+                    let start_pos = i;
+                    i += 1;
+                    let mut s = String::new();
+                    while i < len {
+                        let ch = bytes[i] as char;
+                        if ch == '"' {
+                            i += 1;
+                            break;
+                        }
+                        if ch == '\\' {
+                            if i + 1 >= len {
+                                bail!("unterminated escape in string literal at {}", start_pos);
+                            }
+                            let esc = bytes[i + 1] as char;
+                            match esc {
+                                'n' => s.push('\n'),
+                                'r' => s.push('\r'),
+                                't' => s.push('\t'),
+                                '\\' => s.push('\\'),
+                                '"' => s.push('"'),
+                                '0' => s.push('\0'),
+                                _ => {
+                                    // keep unknown escapes as-is
+                                    s.push('\\');
+                                    s.push(esc);
+                                }
+                            }
+                            i += 2;
+                        } else {
+                            if ch == '\n' {
+                                bail!("newline in string literal at {}", start_pos);
+                            }
+                            s.push(ch);
+                            i += 1;
+                        }
+                    }
+                    tokens.push(tok(TokenKind::StringLiteral(s), start_pos));
+                }
+
                 '0'..='9' => {
                     let start = i;
-                    while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                    while i < len && (bytes[i] as char).is_ascii_digit() {
                         i += 1;
                     }
                     let s = &input[start..i];
                     let n = s.parse::<i64>().unwrap();
                     tokens.push(tok(TokenKind::Number(n), start));
                 }
+
                 'a'..='z' | 'A'..='Z' | '_' => {
+                    // special-case raw strings starting with r / r#
+                    if c == 'r' && i + 1 < len {
+                        let next = bytes[i + 1] as char;
+                        if next == '"' || next == '#' {
+                            let start = i;
+                            i += 1;
+                            let mut hashes = 0;
+                            while i < len && bytes[i] as char == '#' {
+                                hashes += 1;
+                                i += 1;
+                            }
+                            if i >= len || bytes[i] as char != '"' {
+                                bail!("invalid raw string literal at {}", start);
+                            }
+                            i += 1; // skip opening quote
+
+                            loop {
+                                if i >= len {
+                                    bail!("unterminated raw string literal at {}", start);
+                                }
+                                let ch = bytes[i] as char;
+                                if ch == '"' {
+                                    let mut j = 0;
+                                    let mut ok = true;
+                                    while j < hashes {
+                                        if i + 1 + j >= len || bytes[i + 1 + j] as char != '#' {
+                                            ok = false;
+                                            break;
+                                        }
+                                        j += 1;
+                                    }
+                                    if ok {
+                                        i += 1 + hashes;
+                                        break;
+                                    }
+                                }
+                                i += 1;
+                            }
+
+                            let lexeme = &input[start..i];
+                            tokens.push(tok(TokenKind::RawStringLiteral(lexeme.to_string()), start));
+                            continue;
+                        }
+                    }
+
                     let start = i;
                     i += 1;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c.is_ascii_alphanumeric() || c == '_' || c == '!' {
-            i += 1;
-        } else {
-            break;
-        }
-    }
-
+                    while i < len {
+                        let ch = bytes[i] as char;
+                        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '!' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
                     let s = &input[start..i];
                     let kind = match s {
                         "fn" => TokenKind::KwFn,
@@ -116,6 +209,7 @@ mod lexer {
                     };
                     tokens.push(tok(kind, start));
                 }
+
                 _ => bail!("unexpected character {c:?} at {i}"),
             }
         }
@@ -163,6 +257,8 @@ mod ast {
     #[derive(Debug, Clone)]
     pub enum Expr {
         Number(i64),
+        StringLiteral(String),
+        RawStringLiteral(String),
         Var(String),
         BinOp {
             op: BinOp,
@@ -191,7 +287,7 @@ mod ast {
 mod parser {
     use super::ast::*;
     use super::lexer::{Token, TokenKind};
-    use anyhow::{bail, Result};
+    use anyhow::{anyhow, bail, Result};
 
     pub fn parse_program(tokens: &[Token]) -> Result<Program> {
         let mut p = Parser { tokens, pos: 0 };
@@ -401,12 +497,22 @@ mod parser {
         }
 
         fn parse_primary(&mut self) -> Result<Expr> {
-            let tok = self.peek_owned().ok_or_else(|| anyhow::anyhow!("unexpected EOF"))?;
+            let tok = self.peek_owned().ok_or_else(|| anyhow!("unexpected EOF"))?;
 
             match tok.kind {
                 TokenKind::Number(n) => {
                     self.bump();
                     Ok(Expr::Number(n))
+                }
+
+                TokenKind::StringLiteral(s) => {
+                    self.bump();
+                    Ok(Expr::StringLiteral(s))
+                }
+
+                TokenKind::RawStringLiteral(s) => {
+                    self.bump();
+                    Ok(Expr::RawStringLiteral(s))
                 }
 
                 TokenKind::Ident(name) => {
@@ -461,13 +567,14 @@ mod parser {
 
 mod infer {
     use super::ast::*;
-    use anyhow::{bail, Result};
+    use anyhow::{anyhow, bail, Result};
     use std::collections::HashMap;
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub enum Type {
         Int,
         Bool,
+        String,
         Unit,
         Var(u32),
         Generic(String),
@@ -501,6 +608,8 @@ mod infer {
     #[derive(Debug, Clone)]
     pub enum TypedExpr {
         Number(i64, Type),
+        StringLiteral(String, Type),
+        RawStringLiteral(String, Type),
         Var(String, Type),
         BinOp {
             op: BinOp,
@@ -528,6 +637,146 @@ mod infer {
     impl Env {
         fn new() -> Self {
             Env { vars: HashMap::new() }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FuncSig {
+        params: Vec<Type>,
+        ret: Type,
+        type_params: Vec<String>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Ctx {
+        next_var: u32,
+        subs: HashMap<u32, Type>,
+        funcs: HashMap<String, FuncSig>,
+    }
+
+    impl Ctx {
+        fn new() -> Self {
+            Ctx {
+                next_var: 0,
+                subs: HashMap::new(),
+                funcs: HashMap::new(),
+            }
+        }
+
+        fn new_var(&mut self) -> Type {
+            let v = self.next_var;
+            self.next_var += 1;
+            Type::Var(v)
+        }
+
+        fn prune(&self, t: Type) -> Type {
+            match t {
+                Type::Var(v) => {
+                    if let Some(t2) = self.subs.get(&v) {
+                        self.prune(t2.clone())
+                    } else {
+                        Type::Var(v)
+                    }
+                }
+                _ => t,
+            }
+        }
+
+        fn occurs(&self, v: u32, t: &Type) -> bool {
+            match self.prune(t.clone()) {
+                Type::Var(v2) => v == v2,
+                _ => false,
+            }
+        }
+
+        fn unify(&mut self, a: Type, b: Type) -> Result<()> {
+            let a = self.prune(a);
+            let b = self.prune(b);
+            match (a, b) {
+                (Type::Int, Type::Int) => Ok(()),
+                (Type::Bool, Type::Bool) => Ok(()),
+                (Type::String, Type::String) => Ok(()),
+                (Type::Unit, Type::Unit) => Ok(()),
+
+                (Type::Generic(_), _) | (_, Type::Generic(_)) => Ok(()),
+
+                (Type::Var(v), t) | (t, Type::Var(v)) => {
+                    if t == Type::Var(v) {
+                        return Ok(());
+                    }
+                    if self.occurs(v, &t) {
+                        bail!("occurs check failed");
+                    }
+                    self.subs.insert(v, t);
+                    Ok(())
+                }
+
+                (x, y) => bail!("cannot unify {:?} with {:?}", x, y),
+            }
+        }
+
+        fn solve(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn apply_type(&self, t: Type) -> Type {
+            self.prune(t)
+        }
+
+        fn apply_expr(&self, e: TypedExpr) -> TypedExpr {
+            match e {
+                TypedExpr::Number(n, t) => TypedExpr::Number(n, self.apply_type(t)),
+                TypedExpr::StringLiteral(s, t) => TypedExpr::StringLiteral(s, self.apply_type(t)),
+                TypedExpr::RawStringLiteral(s, t) => {
+                    TypedExpr::RawStringLiteral(s, self.apply_type(t))
+                }
+                TypedExpr::Var(n, t) => TypedExpr::Var(n, self.apply_type(t)),
+                TypedExpr::BinOp { op, left, right, ty } => TypedExpr::BinOp {
+                    op,
+                    left: Box::new(self.apply_expr(*left)),
+                    right: Box::new(self.apply_expr(*right)),
+                    ty: self.apply_type(ty),
+                },
+                TypedExpr::Call { name, args, ty } => TypedExpr::Call {
+                    name,
+                    args: args.into_iter().map(|a| self.apply_expr(a)).collect(),
+                    ty: self.apply_type(ty),
+                },
+                TypedExpr::MacroCall { name, args, ty } => TypedExpr::MacroCall {
+                    name,
+                    args: args.into_iter().map(|a| self.apply_expr(a)).collect(),
+                    ty: self.apply_type(ty),
+                },
+            }
+        }
+
+        fn apply_stmt(&self, s: TypedStmt) -> TypedStmt {
+            match s {
+                TypedStmt::Let { name, ty, expr } => TypedStmt::Let {
+                    name,
+                    ty: self.apply_type(ty),
+                    expr: self.apply_expr(expr),
+                },
+                TypedStmt::Expr(e) => TypedStmt::Expr(self.apply_expr(e)),
+                TypedStmt::Return(e) => TypedStmt::Return(self.apply_expr(e)),
+            }
+        }
+
+        fn apply_function(&self, f: TypedFunction) -> TypedFunction {
+            let params = f
+                .params
+                .into_iter()
+                .map(|(n, t)| (n, self.apply_type(t)))
+                .collect();
+            let body = f.body.into_iter().map(|s| self.apply_stmt(s)).collect();
+            let ret_type = self.apply_type(f.ret_type);
+            TypedFunction {
+                name: f.name,
+                type_params: f.type_params,
+                params,
+                body,
+                ret_type,
+            }
         }
     }
 
@@ -590,81 +839,14 @@ mod infer {
         Ok(TypedProgram { functions: typed_funcs })
     }
 
-    #[derive(Debug, Clone)]
-    struct FuncSig {
-        params: Vec<Type>,
-        ret: Type,
-        type_params: Vec<String>,
-    }
-
-    #[derive(Debug, Clone)]
-    struct Ctx {
-        next_var: u32,
-        subs: HashMap<u32, Type>,
-        funcs: HashMap<String, FuncSig>,
-    }
-
     impl Ctx {
-        fn new() -> Self {
-            Ctx {
-                next_var: 0,
-                subs: HashMap::new(),
-                funcs: HashMap::new(),
-            }
-        }
-
-        fn new_var(&mut self) -> Type {
-            let v = self.next_var;
-            self.next_var += 1;
-            Type::Var(v)
-        }
-
-        fn unify(&mut self, a: Type, b: Type) -> Result<()> {
-            let a = self.prune(a);
-            let b = self.prune(b);
-            match (a, b) {
-                (Type::Int, Type::Int) => Ok(()),
-                (Type::Bool, Type::Bool) => Ok(()),
-                (Type::Unit, Type::Unit) => Ok(()),
-
-                (Type::Generic(_), _) | (_, Type::Generic(_)) => Ok(()),
-
-                (Type::Var(v), t) | (t, Type::Var(v)) => {
-                    if t == Type::Var(v) {
-                        return Ok(());
-                    }
-                    if self.occurs(v, &t) {
-                        bail!("occurs check failed");
-                    }
-                    self.subs.insert(v, t);
-                    Ok(())
-                }
-                (x, y) => bail!("cannot unify {:?} with {:?}", x, y),
-            }
-        }
-
-        fn prune(&self, t: Type) -> Type {
-            match t {
-                Type::Var(v) => {
-                    if let Some(t2) = self.subs.get(&v) {
-                        self.prune(t2.clone())
-                    } else {
-                        Type::Var(v)
-                    }
-                }
-                _ => t,
-            }
-        }
-
-        fn occurs(&self, v: u32, t: &Type) -> bool {
-            match self.prune(t.clone()) {
-                Type::Var(v2) => v == v2,
-                _ => false,
-            }
-        }
-
         fn infer_function(&mut self, f: Function) -> Result<TypedFunction> {
-            let sig = self.funcs.get(&f.name).unwrap().clone();
+            let sig = self
+                .funcs
+                .get(&f.name)
+                .ok_or_else(|| anyhow!("missing function sig for {}", f.name))?
+                .clone();
+
             let mut env = Env::new();
             let mut params = Vec::new();
             for (param, ty) in f.params.iter().zip(sig.params.iter()) {
@@ -707,6 +889,15 @@ mod infer {
         fn infer_expr(&mut self, env: &mut Env, e: Expr) -> Result<(TypedExpr, Type)> {
             match e {
                 Expr::Number(n) => Ok((TypedExpr::Number(n, Type::Int), Type::Int)),
+
+                Expr::StringLiteral(s) => {
+                    Ok((TypedExpr::StringLiteral(s, Type::String), Type::String))
+                }
+
+                Expr::RawStringLiteral(s) => {
+                    Ok((TypedExpr::RawStringLiteral(s, Type::String), Type::String))
+                }
+
                 Expr::Var(name) => {
                     if let Some(ty) = env.vars.get(&name) {
                         Ok((TypedExpr::Var(name, ty.clone()), ty.clone()))
@@ -714,6 +905,7 @@ mod infer {
                         bail!("unknown variable {name}")
                     }
                 }
+
                 Expr::BinOp { op, left, right } => {
                     let (l, lt) = self.infer_expr(env, *left)?;
                     let (r, rt) = self.infer_expr(env, *right)?;
@@ -730,11 +922,12 @@ mod infer {
                         ty,
                     ))
                 }
+
                 Expr::Call { name, args } => {
                     let sig = self
                         .funcs
                         .get(&name)
-                        .ok_or_else(|| anyhow::anyhow!("unknown function {name}"))?
+                        .ok_or_else(|| anyhow!("unknown function {name}"))?
                         .clone();
                     if sig.params.len() != args.len() {
                         bail!("arity mismatch in call to {name}");
@@ -761,6 +954,7 @@ mod infer {
                         ret_ty,
                     ))
                 }
+
                 Expr::MacroCall { name, args } => {
                     let mut targs = Vec::new();
                     for arg in args {
@@ -778,70 +972,6 @@ mod infer {
                 }
             }
         }
-
-        fn solve(&mut self) -> Result<()> {
-            Ok(())
-        }
-
-        fn apply_type(&self, t: Type) -> Type {
-            self.prune(t)
-        }
-
-        fn apply_function(&self, f: TypedFunction) -> TypedFunction {
-            let params = f
-                .params
-                .into_iter()
-                .map(|(n, t)| (n, self.apply_type(t)))
-                .collect();
-            let body = f
-                .body
-                .into_iter()
-                .map(|s| self.apply_stmt(s))
-                .collect();
-            let ret_type = self.apply_type(f.ret_type);
-            TypedFunction {
-                name: f.name,
-                type_params: f.type_params,
-                params,
-                body,
-                ret_type,
-            }
-        }
-
-        fn apply_stmt(&self, s: TypedStmt) -> TypedStmt {
-            match s {
-                TypedStmt::Let { name, ty, expr } => TypedStmt::Let {
-                    name,
-                    ty: self.apply_type(ty),
-                    expr: self.apply_expr(expr),
-                },
-                TypedStmt::Expr(e) => TypedStmt::Expr(self.apply_expr(e)),
-                TypedStmt::Return(e) => TypedStmt::Return(self.apply_expr(e)),
-            }
-        }
-
-        fn apply_expr(&self, e: TypedExpr) -> TypedExpr {
-            match e {
-                TypedExpr::Number(n, t) => TypedExpr::Number(n, self.apply_type(t)),
-                TypedExpr::Var(n, t) => TypedExpr::Var(n, self.apply_type(t)),
-                TypedExpr::BinOp { op, left, right, ty } => TypedExpr::BinOp {
-                    op,
-                    left: Box::new(self.apply_expr(*left)),
-                    right: Box::new(self.apply_expr(*right)),
-                    ty: self.apply_type(ty),
-                },
-                TypedExpr::Call { name, args, ty } => TypedExpr::Call {
-                    name,
-                    args: args.into_iter().map(|a| self.apply_expr(a)).collect(),
-                    ty: self.apply_type(ty),
-                },
-                TypedExpr::MacroCall { name, args, ty } => TypedExpr::MacroCall {
-                    name,
-                    args: args.into_iter().map(|a| self.apply_expr(a)).collect(),
-                    ty: self.apply_type(ty),
-                },
-            }
-        }
     }
 }
 
@@ -853,10 +983,10 @@ mod codegen {
     pub fn emit_program(p: &TypedProgram) -> String {
         let mut out = String::new();
         writeln!(&mut out, "// Generated by Resi").unwrap();
-        writeln!(&mut out, "").unwrap();
+        writeln!(&mut out).unwrap();
         for f in &p.functions {
             emit_function(&mut out, f);
-            writeln!(&mut out, "").unwrap();
+            writeln!(&mut out).unwrap();
         }
         out
     }
@@ -926,24 +1056,31 @@ mod codegen {
     fn emit_expr(out: &mut String, e: &TypedExpr) {
         match e {
             TypedExpr::Number(n, _) => write!(out, "{n}").unwrap(),
+
+            TypedExpr::StringLiteral(s, _) => {
+                write!(out, "{:?}", s).unwrap();
+            }
+
+            TypedExpr::RawStringLiteral(lexeme, _) => {
+                write!(out, "{}", lexeme).unwrap();
+            }
+
             TypedExpr::Var(name, _) => write!(out, "{name}").unwrap(),
+
             TypedExpr::BinOp { op, left, right, .. } => {
                 write!(out, "(").unwrap();
                 emit_expr(out, left);
-                write!(
-                    out,
-                    " {} ",
-                    match op {
-                        BinOp::Add => "+",
-                        BinOp::Sub => "-",
-                        BinOp::Mul => "*",
-                        BinOp::Div => "/",
-                    }
-                )
-                .unwrap();
+                let op_str = match op {
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Mul => "*",
+                    BinOp::Div => "/",
+                };
+                write!(out, " {} ", op_str).unwrap();
                 emit_expr(out, right);
                 write!(out, ")").unwrap();
             }
+
             TypedExpr::Call { name, args, .. } => {
                 write!(out, "{}(", name).unwrap();
                 for (i, a) in args.iter().enumerate() {
@@ -954,6 +1091,7 @@ mod codegen {
                 }
                 write!(out, ")").unwrap();
             }
+
             TypedExpr::MacroCall { name, args, .. } => {
                 write!(out, "{}(", name).unwrap();
                 for (i, a) in args.iter().enumerate() {
@@ -971,6 +1109,7 @@ mod codegen {
         match t {
             Type::Int => "i64".to_string(),
             Type::Bool => "bool".to_string(),
+            Type::String => "String".to_string(),
             Type::Unit => "()".to_string(),
             Type::Var(_) => "i64".to_string(),
             Type::Generic(name) => name.clone(),
