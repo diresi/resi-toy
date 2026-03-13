@@ -96,11 +96,16 @@ mod lexer {
                 }
                 'a'..='z' | 'A'..='Z' | '_' => {
                     let start = i;
-                    while i < bytes.len()
-                        && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] as char == '_')
-                    {
-                        i += 1;
-                    }
+                    i += 1;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_alphanumeric() || c == '_' || c == '!' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+
                     let s = &input[start..i];
                     let kind = match s {
                         "fn" => TokenKind::KwFn,
@@ -132,7 +137,7 @@ mod ast {
     #[derive(Debug, Clone)]
     pub struct Function {
         pub name: String,
-        pub type_params: Vec<String>, // e.g. ["T", "U"]
+        pub type_params: Vec<String>,
         pub params: Vec<Param>,
         pub body: Vec<Stmt>,
         pub ret_magic: bool,
@@ -165,6 +170,10 @@ mod ast {
             right: Box<Expr>,
         },
         Call {
+            name: String,
+            args: Vec<Expr>,
+        },
+        MacroCall {
             name: String,
             args: Vec<Expr>,
         },
@@ -262,7 +271,7 @@ mod parser {
 
             let mut type_params = Vec::new();
             if self.check(TokenKind::Lt) {
-                self.bump(); // '<'
+                self.bump();
                 loop {
                     let tp = self.expect_ident()?;
                     type_params.push(tp);
@@ -402,7 +411,22 @@ mod parser {
 
                 TokenKind::Ident(name) => {
                     self.bump();
-                    if self.check(TokenKind::LParen) {
+                    if name.ends_with('!') {
+                        self.expect(TokenKind::LParen)?;
+                        let mut args = Vec::new();
+                        if !self.check(TokenKind::RParen) {
+                            loop {
+                                args.push(self.parse_expr()?);
+                                if self.check(TokenKind::Comma) {
+                                    self.bump();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect(TokenKind::RParen)?;
+                        Ok(Expr::MacroCall { name, args })
+                    } else if self.check(TokenKind::LParen) {
                         self.bump();
                         let mut args = Vec::new();
                         if !self.check(TokenKind::RParen) {
@@ -444,8 +468,9 @@ mod infer {
     pub enum Type {
         Int,
         Bool,
+        Unit,
         Var(u32),
-        Generic(String), // e.g. "T"
+        Generic(String),
     }
 
     #[derive(Debug, Clone)]
@@ -488,6 +513,11 @@ mod infer {
             args: Vec<TypedExpr>,
             ty: Type,
         },
+        MacroCall {
+            name: String,
+            args: Vec<TypedExpr>,
+            ty: Type,
+        },
     }
 
     #[derive(Debug, Clone)]
@@ -498,9 +528,6 @@ mod infer {
     impl Env {
         fn new() -> Self {
             Env { vars: HashMap::new() }
-        }
-        fn with_parent(parent: &Env) -> Self {
-            Env { vars: parent.vars.clone() }
         }
     }
 
@@ -532,7 +559,11 @@ mod infer {
                 for _ in &f.params {
                     param_tys.push(ctx.new_var());
                 }
-                let ret_tv = ctx.new_var();
+                let ret_tv = if f.ret_magic {
+                    ctx.new_var()
+                } else {
+                    Type::Unit
+                };
                 ctx.funcs.insert(
                     f.name.clone(),
                     FuncSig {
@@ -588,29 +619,29 @@ mod infer {
             Type::Var(v)
         }
 
-fn unify(&mut self, a: Type, b: Type) -> Result<()> {
-    let a = self.prune(a);
-    let b = self.prune(b);
-    match (a, b) {
-        (Type::Int, Type::Int) => Ok(()),
-        (Type::Bool, Type::Bool) => Ok(()),
+        fn unify(&mut self, a: Type, b: Type) -> Result<()> {
+            let a = self.prune(a);
+            let b = self.prune(b);
+            match (a, b) {
+                (Type::Int, Type::Int) => Ok(()),
+                (Type::Bool, Type::Bool) => Ok(()),
+                (Type::Unit, Type::Unit) => Ok(()),
 
-        // NEW: generics never get constrained here; let Rust handle them
-        (Type::Generic(_), _) | (_, Type::Generic(_)) => Ok(()),
+                (Type::Generic(_), _) | (_, Type::Generic(_)) => Ok(()),
 
-        (Type::Var(v), t) | (t, Type::Var(v)) => {
-            if t == Type::Var(v) {
-                return Ok(());
+                (Type::Var(v), t) | (t, Type::Var(v)) => {
+                    if t == Type::Var(v) {
+                        return Ok(());
+                    }
+                    if self.occurs(v, &t) {
+                        bail!("occurs check failed");
+                    }
+                    self.subs.insert(v, t);
+                    Ok(())
+                }
+                (x, y) => bail!("cannot unify {:?} with {:?}", x, y),
             }
-            if self.occurs(v, &t) {
-                bail!("occurs check failed");
-            }
-            self.subs.insert(v, t);
-            Ok(())
         }
-        (x, y) => bail!("cannot unify {:?} with {:?}", x, y),
-    }
-}
 
         fn prune(&self, t: Type) -> Type {
             match t {
@@ -712,21 +743,15 @@ fn unify(&mut self, a: Type, b: Type) -> Result<()> {
                     for (arg, pty) in args.into_iter().zip(sig.params.iter()) {
                         let (ta, aty) = self.infer_expr(env, arg)?;
                         match pty {
-                            Type::Generic(_) => { /* let Rust handle it */ }
+                            Type::Generic(_) => {}
                             _ => self.unify(pty.clone(), aty)?,
                         }
                         targs.push(ta);
                     }
-let ret_ty = match sig.ret.clone() {
-    Type::Generic(_) => {
-        // Caller is NOT generic → infer a fresh concrete type variable
-        self.new_var()
-    }
-    other => other,
-};
-
-
-
+                    let ret_ty = match sig.ret.clone() {
+                        Type::Generic(_) => self.new_var(),
+                        other => other,
+                    };
                     Ok((
                         TypedExpr::Call {
                             name,
@@ -734,6 +759,21 @@ let ret_ty = match sig.ret.clone() {
                             ty: ret_ty.clone(),
                         },
                         ret_ty,
+                    ))
+                }
+                Expr::MacroCall { name, args } => {
+                    let mut targs = Vec::new();
+                    for arg in args {
+                        let (ta, _) = self.infer_expr(env, arg)?;
+                        targs.push(ta);
+                    }
+                    Ok((
+                        TypedExpr::MacroCall {
+                            name,
+                            args: targs,
+                            ty: Type::Unit,
+                        },
+                        Type::Unit,
                     ))
                 }
             }
@@ -795,13 +835,19 @@ let ret_ty = match sig.ret.clone() {
                     args: args.into_iter().map(|a| self.apply_expr(a)).collect(),
                     ty: self.apply_type(ty),
                 },
+                TypedExpr::MacroCall { name, args, ty } => TypedExpr::MacroCall {
+                    name,
+                    args: args.into_iter().map(|a| self.apply_expr(a)).collect(),
+                    ty: self.apply_type(ty),
+                },
             }
         }
     }
 }
 
 mod codegen {
-    use super::infer::{Type, TypedExpr, TypedFunction, TypedProgram};
+    use super::ast::BinOp;
+    use super::infer::{Type, TypedExpr, TypedFunction, TypedProgram, TypedStmt};
     use std::fmt::Write;
 
     pub fn emit_program(p: &TypedProgram) -> String {
@@ -816,7 +862,9 @@ mod codegen {
     }
 
     fn emit_function(out: &mut String, f: &TypedFunction) {
-        if !f.type_params.is_empty() {
+        let is_main = f.name == "main";
+
+        if !f.type_params.is_empty() && !is_main {
             write!(out, "fn {}<", f.name).unwrap();
             for (i, tp) in f.type_params.iter().enumerate() {
                 if i > 0 {
@@ -835,23 +883,21 @@ mod codegen {
             }
             write!(out, "{}: {}", name, ty_to_rust(ty)).unwrap();
         }
-        //writeln!(out, ") -> {} {{", ty_to_rust(&f.ret_type)).unwrap();
-let ret = if f.name == "main" {
-    "()".to_string()
-} else {
-    ty_to_rust(&f.ret_type)
-};
-writeln!(out, ") -> {} {{", ret).unwrap();
+
+        if is_main {
+            writeln!(out, ") {{").unwrap();
+        } else {
+            writeln!(out, ") -> {} {{", ty_to_rust(&f.ret_type)).unwrap();
+        }
 
         for stmt in &f.body {
-            emit_stmt(out, stmt, f.name.clone());
+            emit_stmt(out, stmt, is_main);
         }
-        writeln!(&mut *out, "}}").unwrap();
+
+        writeln!(out, "}}").unwrap();
     }
 
-    use super::infer::TypedStmt;
-
-    fn emit_stmt(out: &mut String, s: &TypedStmt, f_name: String) {
+    fn emit_stmt(out: &mut String, s: &TypedStmt, is_main: bool) {
         match s {
             TypedStmt::Let { name, ty, expr } => {
                 write!(out, "    let {}: {} = ", name, ty_to_rust(ty)).unwrap();
@@ -863,20 +909,17 @@ writeln!(out, ") -> {} {{", ret).unwrap();
                 emit_expr(out, e);
                 writeln!(out, ";").unwrap();
             }
-TypedStmt::Return(e) => {
-    if f_name == "main" {
-    //    writeln!(out, "    return ();").unwrap();
-        write!(out, "    std::process::exit(").unwrap();
-        emit_expr(out, e);
-        writeln!(out, " as i32);").unwrap();
-
-    } else {
-        write!(out, "    return ").unwrap();
-        emit_expr(out, e);
-        writeln!(out, ";").unwrap();
-    }
-}
-
+            TypedStmt::Return(e) => {
+                if is_main {
+                    write!(out, "    std::process::exit(").unwrap();
+                    emit_expr(out, e);
+                    writeln!(out, " as i32);").unwrap();
+                } else {
+                    write!(out, "    return ").unwrap();
+                    emit_expr(out, e);
+                    writeln!(out, ";").unwrap();
+                }
+            }
         }
     }
 
@@ -891,10 +934,10 @@ TypedStmt::Return(e) => {
                     out,
                     " {} ",
                     match op {
-                        super::ast::BinOp::Add => "+",
-                        super::ast::BinOp::Sub => "-",
-                        super::ast::BinOp::Mul => "*",
-                        super::ast::BinOp::Div => "/",
+                        BinOp::Add => "+",
+                        BinOp::Sub => "-",
+                        BinOp::Mul => "*",
+                        BinOp::Div => "/",
                     }
                 )
                 .unwrap();
@@ -911,6 +954,16 @@ TypedStmt::Return(e) => {
                 }
                 write!(out, ")").unwrap();
             }
+            TypedExpr::MacroCall { name, args, .. } => {
+                write!(out, "{}(", name).unwrap();
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(out, ", ").unwrap();
+                    }
+                    emit_expr(out, a);
+                }
+                write!(out, ")").unwrap();
+            }
         }
     }
 
@@ -918,6 +971,7 @@ TypedStmt::Return(e) => {
         match t {
             Type::Int => "i64".to_string(),
             Type::Bool => "bool".to_string(),
+            Type::Unit => "()".to_string(),
             Type::Var(_) => "i64".to_string(),
             Type::Generic(name) => name.clone(),
         }
